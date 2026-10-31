@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="使用摄像头识别手部，以食指牵引星群，张开手掌扩散，捏合手势聚拢。"
+    />
+    <title>Hand Field · 手势星场</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <canvas id="field" aria-label="指尖交互粒子画布"></canvas>
+      <div class="grain" aria-hidden="true"></div>
+      <div class="vignette" aria-hidden="true"></div>
+
+      <header class="topbar">
+        <a class="brand" href="./" aria-label="回到手势星场首页">
+          <span class="brand-mark" aria-hidden="true">
+            <i></i>
+            <i></i>
+          </span>
+          <span>
+            <b>HAND//FIELD</b>
+            <small>手势星场</small>
+          </span>
+        </a>
+
+        <div class="top-actions">
+          <button
+            id="cameraToggle"
+            class="camera-toggle"
+            type="button"
+            role="switch"
+            aria-checked="false"
+            title="开启或关闭摄像头（C）"
+          >
+            <span class="toggle-camera-icon" aria-hidden="true"></span>
+            <span id="cameraToggleLabel">摄像头 关</span>
+            <span class="switch-track" aria-hidden="true"><span></span></span>
+          </button>
+          <div class="status-chip">
+            <span id="statusDot" class="status-dot"></span>
+            <span id="statusText">等待启动</span>
+          </div>
+          <button id="fullscreenBtn" class="icon-button" type="button" title="全屏">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+            </svg>
+          </button>
+          <button id="helpBtn" class="icon-button help-button" type="button" title="操作说明">
+            ?
+          </button>
+        </div>
+      </header>
+
+      <section id="intro" class="intro-panel" aria-labelledby="introTitle">
+        <p class="eyebrow">
+          <span></span>
+          CAMERA / PARTICLE LAB
+        </p>
+        <h1 id="introTitle">
+          让星海
+          <span>跟着手指流动</span>
+        </h1>
+        <p class="intro-copy">
+          抬起手，移动食指牵引光点；张开手掌让星空扩散，捏合则令星群聚拢。
+          食指还可以在空中绘制会发光的星轨。
+          所有画面都在你的电脑本地实时计算。
+        </p>
+
+        <div class="intro-actions">
+          <button id="cameraBtn" class="primary-button" type="button">
+            <span class="camera-icon" aria-hidden="true"></span>
+            启用手势交互
+          </button>
+          <button id="demoBtn" class="secondary-button" type="button">
+            先用鼠标体验
+          </button>
+        </div>
+
+        <div class="feature-row" aria-label="交互特点">
+          <div>
+            <span class="feature-index">01</span>
+            <b>实时追踪</b>
+            <small>摄像头识别 21 个手部关节点</small>
+          </div>
+          <div>
+            <span class="feature-index">02</span>
+            <b>隔空牵引</b>
+            <small>指尖坐标实时驱动粒子场</small>
+          </div>
+          <div>
+            <span class="feature-index">03</span>
+            <b>手势控场</b>
+            <small>张开扩散，捏合聚拢，食指牵引</small>
+          </div>
+        </div>
+      </section>
+
+      <section id="hud" class="hud" aria-label="实时状态">
+        <div class="hud-item">
+          <span>识别</span>
+          <strong id="handState">等待手势</strong>
+        </div>
+        <div class="hud-item">
+          <span>手势</span>
+          <strong id="gestureState">—</strong>
+        </div>
+        <div class="hud-item">
+          <span>帧率</span>
+          <strong id="fpsState">— FPS</strong>
+        </div>
+      </section>
+
+      <aside id="cameraPanel" class="camera-panel hidden" aria-label="摄像头预览">
+        <canvas id="previewCanvas" width="480" height="270"></canvas>
+        <div class="camera-label">
+          <span><i></i> LIVE</span>
+          <button id="stopCameraBtn" type="button">关闭</button>
+        </div>
+      </aside>
+
+      <div id="gestureHint" class="gesture-hint hidden" aria-live="polite">
+        <span class="hint-gesture" aria-hidden="true">
+          <i class="finger finger-a"></i>
+          <i class="finger finger-b"></i>
+        </span>
+        <span id="gestureHintText">食指牵引 · 张开扩散 · 捏合聚拢</span>
+      </div>
+
+      <div class="shortcut-strip" id="shortcutStrip">
+        <span><kbd>C</kbd> 摄像头</span>
+        <span><kbd>M</kbd> 鼠标演示</span>
+        <span><kbd>R</kbd> 重置星群</span>
+        <span><kbd>F</kbd> 全屏</span>
+      </div>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+      <dialog id="helpDialog" class="help-dialog">
+        <button id="closeHelpBtn" class="dialog-close" type="button" aria-label="关闭">×</button>
+        <p class="eyebrow"><span></span> GESTURE GUIDE</p>
+        <h2>操作说明</h2>
+        <ol>
+          <li>
+            <b>移动食指</b>
+            <span>指尖会推开近处星点，并在身后留下渐隐的蓝色星尘光带。</span>
+          </li>
+          <li>
+            <b>张开手掌</b>
+            <span>整片星空的亮星会从掌心向外扩散，再缓缓归位。</span>
+          </li>
+          <li>
+            <b>拇指与食指捏合</b>
+            <span>全屏星点会向捏合位置聚拢；松开后继续跟随。</span>
+          </li>
+        </ol>
+        <p class="privacy-note">视频只由当前浏览器在本机处理，不会上传；关闭摄像头后立即停止。</p>
+      </dialog>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
