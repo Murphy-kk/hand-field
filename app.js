@@ -106,10 +106,34 @@ headSpriteContext.fillStyle = headSpriteGradient;
 headSpriteContext.fillRect(0, 0, 64, 64);
 const particleCount = reducedMotion ? 850 : 2200;
 const ambientStarCount = reducedMotion ? 6500 : 22000;
-const handDetectionInterval = 1000 / 30;
+let handDetectionInterval = 1000 / 30;
+const handDetectionIntervalMin = 1000 / 30;
+const handDetectionIntervalMax = 1000 / 12;
 const trailLifetime = 3200;
 const trailDistanceLimit = 520;
 const TAU = Math.PI * 2;
+
+// 手势判定不再依赖单帧结果：
+// 1) 进入与退出使用两套阈值（迟滞），避免临界抖动；
+// 2) 需要连续稳定一段时间才提交（时间确认）；
+// 3) 捏合与张开全局互斥，切换后带冷却（过渡延迟）；
+// 4) 双手靠近时提高确认门槛，专门压制这一场景下的互相污染。
+const GESTURE = {
+  pinchEnter: 0.62,
+  pinchExit: 0.8,
+  openEnter: 1.86,
+  openExit: 1.52,
+  confirmMs: { pinch: 110, open: 160 },
+  releaseMs: { pinch: 100, open: 140 },
+  switchCooldownMs: 260,
+  nearHandRatio: 0.32,
+  nearConfirmBonusMs: 90,
+  scatterCooldownMs: 700,
+};
+
+const gestureLock = { kind: null, lastKind: null, changedAt: -Infinity };
+let scatterCooldownUntil = -Infinity;
+let detectSentAt = 0;
 
 function random(min, max) {
   return min + Math.random() * (max - min);
@@ -281,11 +305,11 @@ async function createHandLandmarker() {
 
   ui.statusText.textContent = "加载手部模型";
   handWorkerPromise = new Promise((resolve, reject) => {
-    const worker = new Worker("./hand-worker.js");
+    const worker = new Worker("./hand-worker.js?v=20261031b");
     const timeout = setTimeout(() => {
       worker.terminate();
       reject(new Error("手部模型初始化超时"));
-    }, 25000);
+    }, 60000);
 
     worker.addEventListener("message", (event) => {
       const message = event.data;
@@ -304,8 +328,27 @@ async function createHandLandmarker() {
       }
       if (message.type === "result") {
         handDetectionBusy = false;
+        if (!usingWorkerStream && detectSentAt) {
+          const cost = performance.now() - detectSentAt;
+          detectSentAt = 0;
+          if (cost > 0) {
+            handDetectionInterval = Math.min(
+              handDetectionIntervalMax,
+              Math.max(handDetectionIntervalMin, cost * 1.1),
+            );
+          }
+        }
         if (mode === "camera") {
           applyDetectedHands(message.landmarks || [], message.handedness || []);
+        }
+      }
+      if (message.type === "stats") {
+        const cost = Number(message.detectMs) || 0;
+        if (cost > 0) {
+          handDetectionInterval = Math.min(
+            handDetectionIntervalMax,
+            Math.max(handDetectionIntervalMin, cost * 1.1),
+          );
         }
       }
       if (message.type === "detect-error") {
@@ -335,13 +378,21 @@ async function createHandLandmarker() {
 
 async function startCamera() {
   if (cameraState === "on") return;
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    setMode("pointer");
+    setCameraState("off");
+    ui.statusText.textContent = "当前浏览器不支持摄像头";
+    showToast(
+      "此页面需要在 Edge 或 Chrome 中直接打开 HTTPS 链接。聊天软件内置预览窗口通常不能使用摄像头。",
+      "error",
+    );
+    return;
+  }
   const requestId = ++cameraRequestId;
   setCameraState("starting");
   ui.cameraBtn.disabled = true;
-  ui.cameraBtn.textContent = "正在准备识别…";
+  ui.cameraBtn.textContent = "正在请求摄像头…";
   try {
-    await createHandLandmarker();
-    if (requestId !== cameraRequestId) return;
     setCameraState("permission");
     ui.statusText.textContent = "等待摄像头授权";
     ui.cameraBtn.textContent = "请在浏览器中允许摄像头";
@@ -367,20 +418,35 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     setMode("camera");
+    ui.statusText.textContent = "摄像头已连接";
+    setCameraState("on");
+    showToast("摄像头已打开，正在加载手部识别模型。首次使用可能需要十几秒。");
+
+    await createHandLandmarker();
+    if (requestId !== cameraRequestId) return;
     if (handWorker?.supportsTrackProcessor) {
       const inferenceTrack = stream.getVideoTracks()[0].clone();
       usingWorkerStream = true;
       handWorker.postMessage({ type: "start-track", track: inferenceTrack }, [inferenceTrack]);
     }
-    setCameraState("on");
-    showToast("手部识别已启动。抬起手，让掌心进入画面。");
+    ui.statusText.textContent = "摄像头与识别已就绪";
+    showToast("手部识别已就绪。抬起手，让掌心进入画面。");
   } catch (error) {
     console.error(error);
     if (requestId !== cameraRequestId) return;
-    releaseCameraStream();
-    setMode("pointer");
-    setCameraState("off");
-    showToast("摄像头未能启动，已切换到鼠标演示。可检查浏览器权限后按 C 重试。", "error");
+    if (stream) {
+      ui.statusText.textContent = "摄像头已打开，识别模型加载失败";
+      setCameraState("on");
+      showToast("摄像头已打开，但手部识别加载失败。请刷新页面或关闭后重试。", "error");
+    } else {
+      releaseCameraStream();
+      setMode("pointer");
+      setCameraState("off");
+      showToast(
+        "摄像头未能打开。请使用 Edge 或 Chrome 直接打开 HTTPS 链接，并允许摄像头权限。",
+        "error",
+      );
+    }
   } finally {
     ui.cameraBtn.disabled = false;
     ui.cameraBtn.innerHTML = '<span class="camera-icon" aria-hidden="true"></span>启用手势交互';
@@ -465,7 +531,7 @@ function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
 }
 
-function createHandState(landmarks, index, handedness = []) {
+function createHandState(landmarks, index, handedness = [], previousHand = null) {
   const thumb = landmarks[4];
   const indexTip = landmarks[8];
   const middleTip = landmarks[12];
@@ -481,15 +547,18 @@ function createHandState(landmarks, index, handedness = []) {
       distance(wrist, ringTip) +
       distance(wrist, pinkyTip)) /
     (scale * 4);
-  const isPinching = pinchRatio < 0.78;
   const extended = [8, 12, 16, 20].map(
     (tipIndex) =>
       distance(wrist, landmarks[tipIndex]) > distance(wrist, landmarks[tipIndex - 2]) * 1.08,
   );
   const extendedCount = extended.filter(Boolean).length;
-  const isOpen = openness > 1.68 && extendedCount >= 3 && !isPinching;
-  const isPointing =
-    extended[0] && !extended[1] && !extended[2] && !extended[3] && !isPinching;
+  const heldGesture = previousHand?.gesture || "palm";
+  const pinchThreshold = heldGesture === "pinch" ? GESTURE.pinchExit : GESTURE.pinchEnter;
+  const openThreshold = heldGesture === "open" ? GESTURE.openExit : GESTURE.openEnter;
+  const rawPinch = pinchRatio < pinchThreshold;
+  const rawOpen = !rawPinch && extendedCount >= 3 && openness > openThreshold;
+  const rawPointing =
+    !rawPinch && extended[0] && !extended[1] && !extended[2] && !extended[3];
   const x = width * (1 - indexTip.x);
   const y = height * indexTip.y;
   const palm = {
@@ -500,9 +569,9 @@ function createHandState(landmarks, index, handedness = []) {
     x: width * (1 - (thumb.x + indexTip.x) / 2),
     y: height * ((thumb.y + indexTip.y) / 2),
   };
-  const focus = isPinching
+  const focus = rawPinch
     ? pinchCenter
-    : isPointing
+    : rawPointing
       ? { x: x * 0.78 + palm.x * 0.22, y: y * 0.78 + palm.y * 0.22 }
       : palm;
   const handednessLabel = handedness?.[0]?.categoryName?.toLowerCase() || "hand";
@@ -523,14 +592,133 @@ function createHandState(landmarks, index, handedness = []) {
     trailY: y,
     palmX: palm.x,
     palmY: palm.y,
-    pinch: isPinching,
-    open: isOpen,
-    pointing: isPointing,
+    gesture: heldGesture,
+    previousGesture: heldGesture,
+    rawPinch,
+    rawOpen,
+    rawPointing,
+    pinch: heldGesture === "pinch",
+    open: heldGesture === "open",
+    pointing: heldGesture === "palm" && rawPointing,
+    pinchScore: previousHand?.pinchScore || 0,
+    openScore: previousHand?.openScore || 0,
+    previousDetectedAt: previousHand?.detectedAt || 0,
+    stateSince: 0,
+    lostAt: 0,
+    detectedAt: 0,
+    justOpened: false,
     strength: 1,
     landmarks,
-    justOpened: false,
-    scatterApplied: false,
   };
+}
+
+function updateGestureStates(now) {
+  const near =
+    hands.length > 1 &&
+    distance(
+      { x: hands[0].palmX, y: hands[0].palmY },
+      { x: hands[1].palmX, y: hands[1].palmY },
+    ) <
+      Math.min(width, height) * GESTURE.nearHandRatio;
+
+  // 1) 证据累计：偶发噪声帧只让分数回落，不会立刻打断确认过程。
+  //    首次出现的手没有上一帧时间，dt 记 0，避免凭空攒够确认分数。
+  for (const hand of hands) {
+    const gap = hand.previousDetectedAt ? now - hand.previousDetectedAt : 0;
+    const dt = Math.max(0, Math.min(80, gap));
+    if (hand.rawPinch) hand.pinchScore = Math.min(600, hand.pinchScore + dt);
+    else hand.pinchScore = Math.max(0, hand.pinchScore - dt * 1.6);
+    if (hand.rawOpen) hand.openScore = Math.min(600, hand.openScore + dt);
+    else hand.openScore = Math.max(0, hand.openScore - dt * 1.6);
+  }
+
+  // 2) 释放：已提交的手势失去原始支撑后，要等释放延迟结束才真的解除
+  for (const hand of hands) {
+    if (hand.gesture !== "pinch" && hand.gesture !== "open") {
+      hand.lostAt = 0;
+      continue;
+    }
+    const supported = hand.gesture === "pinch" ? hand.rawPinch : hand.rawOpen;
+    if (supported) {
+      hand.lostAt = 0;
+      continue;
+    }
+    if (!hand.lostAt) hand.lostAt = now;
+    const releaseMs =
+      hand.gesture === "pinch" ? GESTURE.releaseMs.pinch : GESTURE.releaseMs.open;
+    if (now - hand.lostAt >= releaseMs) {
+      hand.gesture = "palm";
+      hand.lostAt = 0;
+    }
+  }
+
+  // 3) 先记录“已松手”的时刻：让接下来的相反手势进入过渡冷却，
+  //    否则松手与相反手势会在同一帧里无缝换手。
+  const heldAfterRelease = hands.some((hand) => hand.gesture === "pinch")
+    ? "pinch"
+    : hands.some((hand) => hand.gesture === "open")
+      ? "open"
+      : null;
+  if (heldAfterRelease !== gestureLock.kind) {
+    gestureLock.kind = heldAfterRelease;
+    gestureLock.changedAt = now;
+  }
+
+  // 4) 提交：全局互斥（另一只手握着相反手势时直接拒绝）+ 切换冷却 + 靠近加成
+  const pinchNeed = GESTURE.confirmMs.pinch + (near ? GESTURE.nearConfirmBonusMs : 0);
+  const openNeed = GESTURE.confirmMs.open + (near ? GESTURE.nearConfirmBonusMs : 0);
+
+  for (const hand of hands) {
+    const desired =
+      hand.pinchScore >= pinchNeed ? "pinch" : hand.openScore >= openNeed ? "open" : null;
+    if (!desired || desired === hand.gesture) continue;
+    const opposite = desired === "pinch" ? "open" : "pinch";
+    if (near && hands.some((other) => other !== hand && other.gesture === opposite)) continue;
+    if (
+      now - gestureLock.changedAt < GESTURE.switchCooldownMs &&
+      gestureLock.lastKind &&
+      gestureLock.lastKind !== desired
+    ) {
+      continue;
+    }
+    hand.gesture = desired;
+    hand.stateSince = now;
+    hand.lostAt = 0;
+    if (desired === "pinch") hand.openScore = 0;
+    else hand.pinchScore = 0;
+    gestureLock.kind = desired;
+    gestureLock.lastKind = desired;
+    gestureLock.changedAt = now;
+  }
+
+  // 4.5) 双手靠近时不允许任何形式的并发：保留先建立的手势，解除后建立的那个
+  if (near) {
+    const pinchHand = hands.find((hand) => hand.gesture === "pinch");
+    const openHand = hands.find((hand) => hand.gesture === "open");
+    if (pinchHand && openHand) {
+      const dropped = openHand.stateSince >= pinchHand.stateSince ? openHand : pinchHand;
+      dropped.gesture = "palm";
+      dropped.lostAt = 0;
+      gestureLock.kind = hands.some((hand) => hand.gesture === "pinch")
+        ? "pinch"
+        : hands.some((hand) => hand.gesture === "open")
+          ? "open"
+          : null;
+      gestureLock.changedAt = now;
+    }
+  }
+
+  // 5) 派生标志；张开的“上升沿”同时受扩散冷却约束，避免连环散射
+  for (const hand of hands) {
+    hand.pinch = hand.gesture === "pinch";
+    hand.open = hand.gesture === "open";
+    hand.pointing = !hand.pinch && !hand.open && hand.rawPointing;
+    const risingOpen = hand.open && hand.previousGesture !== "open";
+    hand.justOpened = risingOpen && now >= scatterCooldownUntil;
+    if (hand.justOpened) {
+      scatterCooldownUntil = now + GESTURE.scatterCooldownMs;
+    }
+  }
 }
 
 function detectHands(now) {
@@ -543,6 +731,7 @@ function detectHands(now) {
   lastDetectionAt = now;
   handDetectionBusy = true;
   detectionFrame += 1;
+  detectSentAt = now;
 
   createImageBitmap(video, {
     resizeWidth: 384,
@@ -564,20 +753,27 @@ function detectHands(now) {
 }
 
 function applyDetectedHands(landmarksList, handednessList = []) {
+  const now = performance.now();
   const previous = new Map(hands.map((hand) => [hand.id, hand]));
   hands = landmarksList.map((landmarks, index) => {
-    const next = createHandState(landmarks, index, handednessList[index] || []);
-    const old = previous.get(next.id);
-    next.justOpened = Boolean(next.open && (!old || !old.open));
+    const label = handednessList[index]?.[0]?.categoryName?.toLowerCase() || "hand";
+    const old = previous.get(`${label}-${index}`) || null;
+    const next = createHandState(landmarks, index, handednessList[index] || [], old);
     if (old) {
+      // 识别到的间隔越长，前馈补偿越大，抵消低帧率设备上的跟随迟滞；
+      // 正常 30FPS 时补偿量与原来完全一致（0.16 / 0.24）。
+      const gap = old.detectedAt ? Math.min(400, Math.max(0, now - old.detectedAt)) : 33;
+      const overGap = Math.max(0, gap - 33);
+      const targetLead = Math.min(0.42, 0.16 + overGap / 260);
+      const tipLead = Math.min(0.62, 0.24 + overGap / 200);
       const targetVelocityX = next.targetX - old.targetX;
       const targetVelocityY = next.targetY - old.targetY;
       const tipVelocityX = next.targetTipX - old.targetTipX;
       const tipVelocityY = next.targetTipY - old.targetTipY;
-      next.targetX += targetVelocityX * 0.16;
-      next.targetY += targetVelocityY * 0.16;
-      next.targetTipX += tipVelocityX * 0.24;
-      next.targetTipY += tipVelocityY * 0.24;
+      next.targetX += targetVelocityX * targetLead;
+      next.targetY += targetVelocityY * targetLead;
+      next.targetTipX += tipVelocityX * tipLead;
+      next.targetTipY += tipVelocityY * tipLead;
       next.x = old.x;
       next.y = old.y;
       next.tipX = old.tipX;
@@ -587,9 +783,12 @@ function applyDetectedHands(landmarksList, handednessList = []) {
       next.palmX = old.palmX;
       next.palmY = old.palmY;
     }
+    next.detectedAt = now;
     return next;
   });
   hands.sort((left, right) => left.x - right.x);
+
+  updateGestureStates(now);
 
   ui.handState.textContent =
     hands.length === 0 ? "寻找手部" : hands.length === 1 ? "已识别 1 只手" : "已识别 2 只手";
@@ -907,9 +1106,7 @@ function updateParticles(delta) {
   if (mode === "camera") smoothTrackedHands(delta);
   const activeHands = currentHands();
   const driftTime = performance.now() * 0.00015;
-  const scatterHand = activeHands.find(
-    (hand) => hand.open && hand.justOpened && !hand.scatterApplied,
-  );
+  const scatterHand = activeHands.find((hand) => hand.open && hand.justOpened);
 
   if (scatterHand) {
     openGlow = 1;
@@ -925,7 +1122,7 @@ function updateParticles(delta) {
       particle.vy = (outY / length) * launchSpeed;
     }
     for (const hand of activeHands) {
-      if (hand.open && hand.justOpened) hand.scatterApplied = true;
+      hand.justOpened = false;
     }
   }
 
